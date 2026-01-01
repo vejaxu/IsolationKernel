@@ -1,208 +1,193 @@
-import numpy as np
-from scipy.spatial.distance import cdist
-from random import sample
-from tqdm import tqdm  # 用于显示进度条
+import torch
+
 
 class LamdaKernel:
     """
-    Scalable implementation of Continuous Lambda Kernel (Isolation Kernel).
-    
-    优化说明:
-    1. 利用 Voronoi 划分的稀疏性质，推导出解析公式替代原始的张量广播计算。
-       时间复杂度从 O(N * psi^2) 降低到 O(N * psi)。
-       空间复杂度大幅降低，消除了中间的大型三维矩阵。
-    2. 引入 batch_size 处理，支持大规模数据的特征提取。
-    
-    Parameters
-    ----------
-    psi : int
-        采样数 (Subsampling size)，即每个 Estimator 中的中心点数量。
-    t : int
-        集成大小 (Ensemble size)，即树的数量。
-    eta : float
-        衰减系数 (Decay parameter)。
+    Extracts distribution-based features by sampling points and computing
+    normalized exponential distances.
     """
-    def __init__(self, psi=16, t=100, eta=1.0):
+
+    def __init__(self, psi, t, eta=1.0):
+        """
+        Initialize the feature extractor.
+
+        Args:
+            psi (int): Number of points to sample each time.
+            t (int): Number of times to repeat the sampling.
+            eta (float): Parameter for exponential decay. Defaults to 1.0.
+        """
         self.psi = psi
         self.t = t
         self.eta = eta
-        self.centroids = []
-        self.is_fitted = False
+        self.sampled_indices = None
 
-    def fit(self, X):
+    def fit(self, X_train):
         """
-        训练阶段：随机采样构建 t 组 Voronoi 中心点。
+        Sample points from the training input data and store their indices.
+        Note: This method now takes X_train explicitly.
+
+        Args:
+            X_train (torch.Tensor): Training input data matrix of shape (n_train, d).
         """
-        n_samples = X.shape[0]
-        self.centroids = []
-        
-        # 简单检查 psi 是否大于样本数
-        actual_psi = min(self.psi, n_samples)
-        
-        # 使用随机种子确保可复现性（可选）
-        # np.random.seed(42) 
-        
+        n_train = X_train.shape[0]
+        if self.psi > n_train:
+             raise ValueError(f"psi ({self.psi}) cannot be larger than the number of training samples ({n_train}).")
+        # Store all sampled indices for each iteration
+        self.sampled_indices = []
         for _ in range(self.t):
-            # 随机采样 psi 个索引
-            # 使用 numpy 的 choice 比 random.sample 在大数据下略快且易于管理
-            sub_index = np.random.choice(n_samples, actual_psi, replace=False)
-            self.centroids.append(X[sub_index, :])
-            
-        self.is_fitted = True
+            indices = torch.randperm(n_train)[:self.psi]
+            self.sampled_indices.append(indices)
         return self
 
-    def transform(self, X, batch_size=1024):
+    def transform(self, X, X_train):
         """
-        将数据转换为连续 Lambda 特征，支持大规模数据分批处理。
-        
-        Parameters
-        ----------
-        X : np.ndarray
-            输入数据，形状 (n_samples, n_features)
-        batch_size : int
-            批处理大小，防止内存溢出。
-            
-        Returns
-        -------
-        final_features : np.ndarray
-            形状 (n_samples, t * psi) 的稠密特征矩阵。
-        """
-        if not self.is_fitted:
-            raise RuntimeError("Model must be fitted before calling transform!")
-            
-        n_samples = X.shape[0]
-        # 预分配最终的特征矩阵，避免频繁内存申请
-        final_features = np.zeros((n_samples, self.t * self.psi), dtype=np.float32)
-        
-        # 分批处理数据
-        for start_idx in tqdm(range(0, n_samples, batch_size), desc="Extracting Features"):
-            end_idx = min(start_idx + batch_size, n_samples)
-            X_batch = X[start_idx:end_idx]
-            n_batch = X_batch.shape[0]
-            
-            # 对每一棵树（Estimator）进行计算
-            for i in range(self.t):
-                current_centroids = self.centroids[i] # (psi, d)
-                
-                # 1. 计算距离矩阵 (n_batch, psi)
-                # metric='sqeuclidean' 通常比 'euclidean' 快，如果不想开方可以用 sqeuclidean 配合调整 eta
-                # 这里为了保持和原论文一致，使用 euclidean
-                dists = cdist(X_batch, current_centroids, metric='euclidean')
-                
-                # 2. 找到最近邻 (Voronoi 划分)
-                nearest_idx = np.argmin(dists, axis=1) # (n_batch,)
-                
-                # 3. 获取最近邻距离 d
-                # fancy indexing
-                min_dists = dists[np.arange(n_batch), nearest_idx] # (n_batch,)
-                
-                # 4. 利用解析解直接计算特征值 (Optimization)
-                # 原始逻辑：normalization_partition 计算 exp(-2*eta*(vi - vj)) 的归一化
-                
-                # 公式 A: Active Centroid (也就是最近的那个中心点) 的值
-                # val = 1 / sqrt(1 + (psi-1) * exp(-2 * eta * d))
-                # 避免溢出：如果 d 很大，exp(-2*eta*d) -> 0, val -> 1
-                term_active = (self.psi - 1) * np.exp(-2 * self.eta * min_dists)
-                val_active = 1.0 / np.sqrt(1.0 + term_active)
-                
-                # 公式 B: Inactive Centroids (其他 psi-1 个中心点) 的值
-                # val = 1 / sqrt(exp(2 * eta * d) + psi - 1)
-                # 避免溢出：如果 d 很大，exp(2*eta*d) 极大，val -> 0
-                term_inactive = np.exp(2 * self.eta * min_dists) + (self.psi - 1)
-                val_inactive = 1.0 / np.sqrt(term_inactive)
-                
-                # 5. 填充特征矩阵
-                # 这一块在 final_features 中的列范围
-                col_start = i * self.psi
-                col_end = (i + 1) * self.psi
-                
-                # 先用 inactive 值填充整个块
-                # feature_block shape: (n_batch, psi)
-                # 利用广播机制填充
-                feature_block = val_inactive[:, np.newaxis].repeat(self.psi, axis=1)
-                
-                # 再修正 active (最近邻) 的位置
-                feature_block[np.arange(n_batch), nearest_idx] = val_active
-                
-                # 写入大矩阵
-                final_features[start_idx:end_idx, col_start:col_end] = feature_block
+        Transform the input data using the sampled points from X_train.
 
-        # 全局归一化 (对应 Lambda_feature.py 中的 / np.sqrt(t))
-        final_features /= np.sqrt(self.t)
-        
+        Args:
+            X (torch.Tensor): Input data matrix of shape (n, d) to transform.
+            X_train (torch.Tensor): Training data matrix of shape (n_train, d)
+                                    used for the sampling reference.
+
+        Returns:
+            torch.Tensor: Feature matrix of shape (n, psi*t).
+        """
+        if self.sampled_indices is None:
+            raise ValueError("Model has not been fitted yet. Call fit(X_train) first.")
+
+        device = X.device
+        n = X.shape[0]
+        all_features = []
+
+        for indices in self.sampled_indices:
+            # Sample points from the *training* data
+            sampled_points = X_train[indices] # Shape: (psi, d)
+
+            # Compute distances between all points in X and sampled points
+            # X.unsqueeze(1): (n, 1, d)
+            # sampled_points.unsqueeze(0): (1, psi, d)
+            diff = X.unsqueeze(1) - sampled_points.unsqueeze(0)  # shape: (n, psi, d)
+            distances = torch.norm(diff, dim=2)  # shape: (n, psi)
+
+            # Compute exponential term with stability epsilon
+            exp_term = torch.exp(-self.eta * distances) / (distances + 1e-10)
+
+            # Normalize features for each sample point by the sum across sampled points
+            # Add epsilon to sum for stability
+            sum_exp = exp_term.sum(dim=1, keepdim=True) + 1e-10 # Shape: (n, 1)
+            normalized_exp_term = exp_term / sum_exp # Shape: (n, psi)
+
+            all_features.append(normalized_exp_term)
+
+        # Concatenate all features from t iterations
+        final_features = torch.cat(all_features, dim=1)  # shape: (n, psi*t)
+
         return final_features
 
-# ==========================================
-# 性能与正确性测试代码
-# ==========================================
-if __name__ == "__main__":
-    import time
-    
-    # 1. 生成大规模模拟数据 (例如 10万样本)
-    N = 10000 
-    D = 10
-    print(f"Generating {N} samples with {D} dimensions...")
-    X_train = np.random.rand(N, D)
-    X_test = np.random.rand(1000, D)
-    
-    # 2. 初始化模型
-    psi = 16
-    t = 100
-    eta = 0.5
-    model = LamdaKernel(psi=psi, t=t, eta=eta)
-    
-    # 3. 拟合
-    print("Fitting model...")
-    start_time = time.time()
-    model.fit(X_train)
-    print(f"Fit time: {time.time() - start_time:.4f}s")
-    
-    # 4. 转换 (提速版)
-    print(f"Transforming {N} samples (Scalable Implementation)...")
-    start_time = time.time()
-    features = model.transform(X_train, batch_size=2048)
-    end_time = time.time()
-    
-    print(f"Transform time: {end_time - start_time:.4f}s")
-    print(f"Output shape: {features.shape}")
-    print(f"Features mean: {np.mean(features):.6f}")
-    
-    # 5. 验证数学一致性 (使用小样本对比)
-    # 我们手动用原来的慢速公式算一个样本，看看结果是否一样
-    print("\nVerifying mathematical correctness with a single sample...")
-    
-    # 取第一个 estimator 的中心点
-    centroids = model.centroids[0]
-    x_sample = X_train[0:1]
-    
-    # 手动计算
-    dists = cdist(x_sample, centroids)
-    nearest_idx = np.argmin(dists)
-    d = dists[0, nearest_idx]
-    
-    # 原始论文逻辑模拟
-    # 构造稀疏向量 [0, ..., d, ..., 0]
-    sparse_vec = np.zeros(psi)
-    sparse_vec[nearest_idx] = d
-    
-    # 原始 normalization_partition 逻辑
-    a = sparse_vec.reshape(psi, 1) # (psi, 1)
-    # M[i, j] = a[j] - a[i] (注意原代码维度变换逻辑，这里简化表达)
-    # 原代码: M = a_exp - tmp_2. a_exp[i,j] = a[j], tmp_2[i,j] = a[i]
-    # M[i, j] = val_j - val_i
-    M = a.T - a # (1, psi) - (psi, 1) -> (psi, psi) via broadcasting
-    # Sum over axis=0 (i)
-    denom = np.sqrt(np.sum(np.exp(-2 * eta * M), axis=0))
-    expected_block = (1.0 / denom).reshape(1, -1)
-    
-    # 我们的快速计算结果
-    calculated_block = features[0, 0:psi] * np.sqrt(t) # 撤销最后的全局归一化以便对比
-    
-    print("Expected (First 5):  ", expected_block[0, :5])
-    print("Calculated (First 5):", calculated_block[:5])
-    
-    diff = np.abs(expected_block - calculated_block)
-    if np.max(diff) < 1e-5:
-        print("\n✅ Verification PASSED! The optimization is mathematically equivalent.")
-    else:
-        print("\n❌ Verification FAILED!")
+    def fit_transform(self, X):
+        """
+        Fit the model using X as training data and transform X.
+
+        Args:
+            X (torch.Tensor): Input data matrix of shape (n, d).
+
+        Returns:
+            torch.Tensor: Feature matrix of shape (n, psi*t).
+        """
+        return self.fit(X).transform(X, X) # Use X for both fitting and transforming
+
+
+if __name__ == '__main__':
+    import unittest
+    import torch
+    import numpy as np
+
+    class TestDistributionFeatureExtractor(unittest.TestCase):
+
+        def setUp(self):
+            # 固定随机种子，保证测试结果可复现
+            torch.manual_seed(42)
+
+            # 构造一些模拟数据
+            self.n_samples = 50   # 样本数量
+            self.d_features = 10  # 原始特征维度
+            self.psi = 5          # 每次采样的点数
+            self.t = 3            # 迭代次数
+            self.eta = 1.0        # 衰减系数
+
+            self.X_train = torch.randn(self.n_samples, self.d_features)
+            self.extractor = LamdaKernel(psi=self.psi, t=self.t, eta=self.eta)
+
+        def test_output_shape(self):
+            """测试 1: 输出形状是否正确 (N, psi * t)"""
+            print("\n[测试 1] 验证输出特征矩阵的形状...")
+
+            features = self.extractor.fit_transform(self.X_train)
+
+            expected_shape = (self.n_samples, self.psi * self.t)
+            self.assertEqual(features.shape, expected_shape, 
+                             f"形状错误: 期望 {expected_shape}, 实际得到 {features.shape}")
+            print(" -> 形状验证通过。")
+
+        def test_normalization_property(self):
+            """测试 2: 验证每一组 psi 特征的和是否为 1 (归一化逻辑)"""
+            print("\n[测试 2] 验证分组归一化性质 (Sum = 1)...")
+
+            features = self.extractor.fit_transform(self.X_train)
+
+            # 特征矩阵的列数是 psi * t。
+            # 逻辑上，每一次迭代 t 生成的 psi 个特征，其和应该为 1。
+            # 我们检查第一个样本 (row 0) 的第一组特征 (前 psi 列)
+
+            first_group_sum = features[0, :self.psi].sum().item()
+
+            # 使用 assertAlmostEqual 处理浮点数精度问题
+            self.assertAlmostEqual(first_group_sum, 1.0, places=5, 
+                                   msg=f"归一化失败: 第一组特征之和应为 1.0, 实际为 {first_group_sum}")
+
+            # 检查第二组特征
+            second_group_sum = features[0, self.psi : 2*self.psi].sum().item()
+            self.assertAlmostEqual(second_group_sum, 1.0, places=5)
+
+            print(" -> 归一化逻辑验证通过。")
+
+        def test_transform_on_new_data(self):
+            """测试 3: 模拟在新数据(测试集)上的 Transform"""
+            print("\n[测试 3] 验证在新数据上的 Transform...")
+
+            # 拟合训练集
+            self.extractor.fit(self.X_train)
+
+            # 创建新的测试数据 (例如 5 个样本)
+            X_test = torch.randn(5, self.d_features)
+
+            # 注意: 根据你的代码逻辑，transform 时必须再次传入 X_train 作为参照
+            features_test = self.extractor.transform(X_test, self.X_train)
+
+            expected_test_shape = (5, self.psi * self.t)
+            self.assertEqual(features_test.shape, expected_test_shape)
+            print(" -> 测试集转换验证通过。")
+
+        def test_psi_size_error(self):
+            """测试 4: 当 psi > 样本数时，是否抛出 ValueError"""
+            print("\n[测试 4] 验证非法参数捕获...")
+
+            # 设置 psi 比样本数大
+            large_psi = self.n_samples + 10
+            bad_extractor = LamdaKernel(psi=large_psi, t=1)
+
+            with self.assertRaises(ValueError):
+                bad_extractor.fit(self.X_train)
+
+            print(" -> 异常捕获验证通过。")
+
+        def test_transform_without_fit(self):
+            """测试 5: 未调用 fit 直接调用 transform 是否报错"""
+            print("\n[测试 5] 验证未拟合直接转换的错误处理...")
+
+            new_extractor = LamdaKernel(psi=5, t=1)
+            with self.assertRaises(ValueError):
+                new_extractor.transform(self.X_train, self.X_train)
+
+            print(" -> 流程控制验证通过。")
+
+    unittest.main(argv=['first-arg-is-ignored'], exit=False)
